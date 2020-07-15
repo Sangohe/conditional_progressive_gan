@@ -144,6 +144,7 @@ def minibatch_stddev_layer(x, group_size=4):
 def G_paper(
     latents_in,                         # First input: Latent vectors [minibatch, latent_size].
     labels_in,                          # Second input: Labels [minibatch, label_size].
+    masks_in,                           # Third input: Masks [minibatch, 1, ?, ?].
     num_channels        = 1,            # Number of output color channels. Overridden based on dataset.
     resolution          = 32,           # Output resolution. Overridden based on dataset.
     label_size          = 0,            # Dimensionality of the labels, 0 if no labels. Overridden based on dataset.
@@ -172,8 +173,69 @@ def G_paper(
     
     latents_in.set_shape([None, latent_size])
     labels_in.set_shape([None, label_size])
-    combo_in = tf.cast(tf.concat([latents_in, labels_in], axis=1), dtype)
+    masks_in.set_shape([None, 1, resolution, resolution])
     lod_in = tf.cast(tf.get_variable('lod', initializer=np.float32(0.0), trainable=False), dtype)
+    
+    def embed_mask(x, res): # res = 2..resolution_log2
+
+        def fromrgb(x, res): # res = 2..resolution_log2
+            with tf.variable_scope('FromRGB_lod%d' % (resolution_log2 - res)):
+                return act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=1, use_wscale=use_wscale)))
+
+        def embed_block(x, res):
+            with tf.variable_scope('%dx%d' % (2**res, 2**res)):
+                if res >= 3: # 8x8 and up
+                    with tf.variable_scope('Conv0'):
+                        x = act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale)))
+                    if fused_scale:
+                        with tf.variable_scope('Conv1_down'):
+                            x = act(apply_bias(conv2d_downscale2d(x, fmaps=nf(res-2), kernel=3, use_wscale=use_wscale)))
+                    else:
+                        with tf.variable_scope('Conv1'):
+                            x = act(apply_bias(conv2d(x, fmaps=nf(res-2), kernel=3, use_wscale=use_wscale)))
+                        x = downscale2d(x)
+                else: # 4x4
+                    with tf.variable_scope('Conv'):
+                        x = act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale)))
+                    with tf.variable_scope('Dense0'):
+                        x = act(apply_bias(dense(x, fmaps=nf(res-2), use_wscale=use_wscale)))
+                    with tf.variable_scope('Dense1'):
+                        x = apply_bias(dense(x, fmaps=nf(res-2), gain=1, use_wscale=use_wscale))
+                        x = pixel_norm(x, epsilon=pixelnorm_epsilon)
+                return x
+
+        if structure == 'linear':
+            with tf.variable_scope('EmbedMask'):
+                mask = x
+                x = fromrgb(x, resolution_log2)
+                for res in range(resolution_log2, 2, -1):
+                    lod = resolution_log2 - res
+                    x = embed_block(x, res)
+                    mask = downscale2d(mask)
+                    y = fromrgb(mask, res - 1)
+                    x = lerp_clip(x, y, lod_in - lod)
+                x = embed_block(x, 2)
+
+        # Recursive structure: complex but efficient.
+        if structure == 'recursive':
+            def grow(res, lod):
+                masks = x
+                x = lambda: fromrgb(downscale2d(masks, 2**lod), res)
+                if lod > 0: x = cset(x, (lod_in < lod), lambda: grow(res + 1, lod - 1))
+                x = embed_block(x(), res); y = lambda: x
+                if res > 2: y = cset(y, (lod_in > lod), lambda: lerp(x, fromrgb(downscale2d(masks, 2**(lod+1)), res - 1), lod_in - lod))
+                return y()
+            x = grow(2, resolution_log2 - 2)
+
+        # x = fromrgb(x, resolution_log2)
+        # for res in range(resolution_log2, 2, -1):
+        #     x = embed_block(x, res)
+        # x = embed_block(x, 2)
+
+        return x
+
+    embedded_mask = embed_mask(masks_in, resolution_log2)
+    combo_in = tf.cast(tf.concat([latents_in, labels_in, embedded_mask], axis=1), dtype)
 
     # Building blocks.
     def block(x, res): # res = 2..resolution_log2

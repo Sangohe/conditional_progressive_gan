@@ -35,20 +35,22 @@ def setup_snapshot_image_grid(G, training_set,
     # Fill in reals and labels.
     reals = np.zeros([gw * gh] + training_set.shape, dtype=training_set.dtype)
     labels = np.zeros([gw * gh, training_set.label_size], dtype=training_set.label_dtype)
+    masks = np.zeros([gw * gh] + [1] + training_set.shape[1:], dtype=training_set.dtype)
     for idx in range(gw * gh):
         x = idx % gw; y = idx // gw
         while True:
-            real, label = training_set.get_minibatch_np(1)
+            real, label, mask = training_set.get_minibatch_np(1)
             if layout == 'row_per_class' and training_set.label_size > 0:
                 if label[0, y % training_set.label_size] == 0.0:
                     continue
             reals[idx] = real[0]
             labels[idx] = label[0]
+            masks[idx] = mask[0]
             break
 
     # Generate latents.
     latents = misc.random_latents(gw * gh, G)
-    return (gw, gh), reals, labels, latents
+    return (gw, gh), reals, labels, masks, latents
 
 #----------------------------------------------------------------------------
 # Just-in-time processing of training images before feeding them to the networks.
@@ -64,6 +66,36 @@ def process_reals(x, lod, mirror_augment, drange_data, drange_net):
                 mask = tf.random_uniform([s[0], 1, 1, 1], 0.0, 1.0)
                 mask = tf.tile(mask, [1, s[1], s[2], s[3]])
                 x = tf.where(mask < 0.5, x, tf.reverse(x, axis=[3]))
+        with tf.name_scope('FadeLOD'): # Smooth crossfade between consecutive levels-of-detail.
+            s = tf.shape(x)
+            y = tf.reshape(x, [-1, s[1], s[2]//2, 2, s[3]//2, 2])
+            y = tf.reduce_mean(y, axis=[3, 5], keepdims=True)
+            y = tf.tile(y, [1, 1, 1, 2, 1, 2])
+            y = tf.reshape(y, [-1, s[1], s[2], s[3]])
+            x = tfutil.lerp(x, y, lod - tf.floor(lod))
+        with tf.name_scope('UpscaleLOD'): # Upscale to match the expected input/output size of the networks.
+            s = tf.shape(x)
+            factor = tf.cast(2 ** tf.floor(lod), tf.int32)
+            x = tf.reshape(x, [-1, s[1], s[2], 1, s[3], 1])
+            x = tf.tile(x, [1, 1, 1, factor, 1, factor])
+            x = tf.reshape(x, [-1, s[1], s[2] * factor, s[3] * factor])
+        return x
+
+#----------------------------------------------------------------------------
+# Just-in-time processing of masks before feeding them to the networks.
+
+def process_masks(x, lod, mirror_augment, drange_data, drange_net):
+    with tf.name_scope('ProcessMasks'):
+        with tf.name_scope('DynamicRange'):
+            x = tf.cast(x, tf.float32)
+            x = misc.adjust_dynamic_range(x, drange_data, drange_net)
+        if mirror_augment:
+            with tf.name_scope('MirrorAugment'):
+                s = tf.shape(x)
+                mask = tf.random_uniform([s[0], 1, 1, 1], 0.0, 1.0)
+                mask = tf.tile(mask, [1, s[1], s[2], s[3]])
+                x = tf.where(mask < 0.5, 
+                x, tf.reverse(x, axis=[3]))
         with tf.name_scope('FadeLOD'): # Smooth crossfade between consecutive levels-of-detail.
             s = tf.shape(x)
             y = tf.reshape(x, [-1, s[1], s[2]//2, 2, s[3]//2, 2])
@@ -166,13 +198,14 @@ def train_progressive_gan(
 
     print('Building TensorFlow graph...')
     with tf.name_scope('Inputs'):
-        lod_in          = tf.placeholder(tf.float32, name='lod_in', shape=[])
-        lrate_in        = tf.placeholder(tf.float32, name='lrate_in', shape=[])
-        minibatch_in    = tf.placeholder(tf.int32, name='minibatch_in', shape=[])
-        minibatch_split = minibatch_in // config.num_gpus
-        reals, labels   = training_set.get_minibatch_tf()
-        reals_split     = tf.split(reals, config.num_gpus)
-        labels_split    = tf.split(labels, config.num_gpus)
+        lod_in                 = tf.placeholder(tf.float32, name='lod_in', shape=[])
+        lrate_in               = tf.placeholder(tf.float32, name='lrate_in', shape=[])
+        minibatch_in           = tf.placeholder(tf.int32, name='minibatch_in', shape=[])
+        minibatch_split        = minibatch_in // config.num_gpus
+        reals, labels, masks   = training_set.get_minibatch_tf()
+        reals_split            = tf.split(reals, config.num_gpus)
+        labels_split           = tf.split(labels, config.num_gpus)
+        masks_split            = tf.split(masks, config.num_gpus)
     G_opt = tfutil.Optimizer(name='TrainG', learning_rate=lrate_in, **config.G_opt)
     D_opt = tfutil.Optimizer(name='TrainD', learning_rate=lrate_in, **config.D_opt)
     for gpu in range(config.num_gpus):
@@ -182,24 +215,32 @@ def train_progressive_gan(
             lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
             reals_gpu = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
             labels_gpu = labels_split[gpu]
+            real_masks_gpu = process_masks(masks_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
             with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
-                G_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **config.G_loss)
+                G_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, real_masks=real_masks_gpu, **config.G_loss)
             with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
-                D_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, **config.D_loss)
+                D_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, masks=real_masks_gpu, **config.D_loss)
             G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
             D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
     G_train_op = G_opt.apply_updates()
     D_train_op = D_opt.apply_updates()
 
     print('Setting up snapshot image grid...')
-    grid_size, grid_reals, grid_labels, grid_latents = setup_snapshot_image_grid(G, training_set, **config.grid)
+    grid_size, grid_reals, grid_labels, grid_masks, grid_latents = setup_snapshot_image_grid(G, training_set, **config.grid)
     sched = TrainingSchedule(total_kimg * 1000, training_set, **config.sched)
-    grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus)
+    grid_fakes = Gs.run(grid_latents, grid_labels, grid_masks, minibatch_size=sched.minibatch//config.num_gpus)
 
     print('Setting up result dir...')
     result_subdir = misc.create_result_subdir(config.result_dir, config.desc)
-    misc.save_image_grid(grid_reals, os.path.join(result_subdir, 'reals.png'), drange=training_set.dynamic_range, grid_size=grid_size)
-    misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fakes%06d.png' % 0), drange=drange_net, grid_size=grid_size)
+    reals_grid_path = os.path.join(result_subdir, 'reals.png')
+    misc.save_image_grid(grid_reals, reals_grid_path, drange=training_set.dynamic_range, grid_size=grid_size)
+    print(f"Saved reals grid to {reals_grid_path}")
+    masks_grid_path = os.path.join(result_subdir, 'masks.png')
+    misc.save_image_grid(grid_masks, masks_grid_path, drange=training_set.dynamic_range, grid_size=grid_size)
+    print(f"Saved masks grid to {masks_grid_path}")
+    fakes_grid_path = os.path.join(result_subdir, 'fakes%06d.png' % 0)
+    misc.save_image_grid(grid_fakes, fakes_grid_path, drange=drange_net, grid_size=grid_size)
+    print(f"Saved fakes grid to {fakes_grid_path}")
     summary_log = tf.summary.FileWriter(result_subdir)
     if save_tf_graph:
         summary_log.add_graph(tf.get_default_graph())
@@ -218,6 +259,7 @@ def train_progressive_gan(
         # Choose training parameters and configure training ops.
         sched = TrainingSchedule(cur_nimg, training_set, **config.sched)
         training_set.configure(sched.minibatch, sched.lod)
+        print(vars(sched))
         if reset_opt_for_new_lod:
             if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
                 G_opt.reset_optimizer_state(); D_opt.reset_optimizer_state()
@@ -226,9 +268,13 @@ def train_progressive_gan(
         # Run training ops.
         for repeat in range(minibatch_repeats):
             for _ in range(D_repeats):
+                print("Aca se farrea")
                 tfutil.run([D_train_op, Gs_update_op], {lod_in: sched.lod, lrate_in: sched.D_lrate, minibatch_in: sched.minibatch})
                 cur_nimg += sched.minibatch
+            print("Ah no, es aca que se farrea")
+            print(sched.lod, sched.G_lrate, sched.minibatch)
             tfutil.run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
+            print("Gonorrea ome")
 
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
@@ -258,7 +304,7 @@ def train_progressive_gan(
 
             # Save snapshots.
             if cur_tick % image_snapshot_ticks == 0 or done:
-                grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus)
+                grid_fakes = Gs.run(grid_latents, grid_labels, grid_masks, minibatch_size=sched.minibatch//config.num_gpus)
                 misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fakes%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
             if cur_tick % network_snapshot_ticks == 0 or done:
                 misc.save_pkl((G, D, Gs), os.path.join(result_subdir, 'network-snapshot-%06d.pkl' % (cur_nimg // 1000)))

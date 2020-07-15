@@ -28,6 +28,32 @@ def parse_tfrecord_np(record):
     data = ex.features.feature['data'].bytes_list.value[0]
     return np.fromstring(data, np.uint8).reshape(shape)
 
+def parse_tfrecord_mask_tf(record):
+    features = tf.parse_single_example(record, features={
+        'shape': tf.FixedLenFeature([3], tf.int64),
+        'data': tf.FixedLenFeature([], tf.string),
+        'mask_shape': tf.FixedLenFeature([3], tf.int64),
+        'mask': tf.FixedLenFeature([], tf.string),
+        })
+    image = tf.decode_raw(features['data'], tf.uint8)
+    image = tf.reshape(image, features['shape'])
+    mask = tf.decode_raw(features['mask'], tf.uint8)
+    mask = tf.reshape(mask, features['mask_shape'])
+    
+    return image, mask
+
+def parse_tfrecord_mask_np(record):
+    ex = tf.train.Example()
+    ex.ParseFromString(record)
+    shape = ex.features.feature['shape'].int64_list.value
+    image = ex.features.feature['data'].bytes_list.value[0]
+    mask_shape = ex.features.feature['mask_shape'].int64_list.value
+    mask = ex.features.feature['mask'].bytes_list.value[0]
+
+    image = np.fromstring(image, np.uint8).reshape(shape)
+    mask = np.fromstring(mask, np.uint8).reshape(mask_shape)
+    return image, mask
+
 #----------------------------------------------------------------------------
 # Dataset class that loads data from tfrecords files.
 
@@ -37,6 +63,7 @@ class TFRecordDataset:
         resolution      = None,     # Dataset resolution, None = autodetect.
         label_file      = None,     # Relative path of the labels file, None = autodetect.
         max_label_size  = 0,        # 0 = no labels, 'full' = full labels, <int> = N first label components.
+        masks           = False,    # If there are masks in the tfrecord
         repeat          = True,     # Repeat dataset indefinitely.
         shuffle_mb      = 4096,     # Shuffle data within specified window (megabytes), 0 = disable shuffling.
         prefetch_mb     = 2048,     # Amount of data to prefetch (megabytes), 0 = disable prefetching.
@@ -52,6 +79,7 @@ class TFRecordDataset:
         self.label_file         = label_file
         self.label_size         = None      # [component]
         self.label_dtype        = None
+        self._masks             = masks
         self._np_labels         = None
         self._tf_minibatch_in   = None
         self._tf_labels_var     = None
@@ -71,8 +99,12 @@ class TFRecordDataset:
         for tfr_file in tfr_files:
             tfr_opt = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.NONE)
             for record in tf.python_io.tf_record_iterator(tfr_file, tfr_opt):
-                tfr_shapes.append(parse_tfrecord_np(record).shape)
-                break
+                if self._masks:
+                    tfr_shapes.append(parse_tfrecord_mask_np(record)[0].shape)
+                    break
+                else:
+                    tfr_shapes.append(parse_tfrecord_np(record).shape)
+                    break
 
         # Autodetect label filename.
         if self.label_file is None:
@@ -117,8 +149,14 @@ class TFRecordDataset:
                 if tfr_lod < 0:
                     continue
                 dset = tf.data.TFRecordDataset(tfr_file, compression_type='', buffer_size=buffer_mb<<20)
-                dset = dset.map(parse_tfrecord_tf, num_parallel_calls=num_threads)
-                dset = tf.data.Dataset.zip((dset, self._tf_labels_dataset))
+                if self._masks:
+                    dset = dset.map(parse_tfrecord_mask_tf, num_parallel_calls=num_threads)
+                    dset_images = dset.map(lambda image, mask: image)
+                    dset_masks = dset.map(lambda image, mask: mask)
+                    dset = tf.data.Dataset.zip((dset_images, self._tf_labels_dataset, dset_masks))
+                else:
+                    dset = dset.map(parse_tfrecord_tf, num_parallel_calls=num_threads)
+                    dset = tf.data.Dataset.zip((dset, self._tf_labels_dataset))
                 bytes_per_item = np.prod(tfr_shape) * np.dtype(self.dtype).itemsize
                 if shuffle_mb > 0:
                     dset = dset.shuffle(((shuffle_mb << 20) - 1) // bytes_per_item + 1)
